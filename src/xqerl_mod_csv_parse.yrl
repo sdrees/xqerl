@@ -1,12 +1,12 @@
-Nonterminals 
+Nonterminals
    file
    record
    records
    nls.
 
-Terminals  
-   field 
-   efield 
+Terminals
+   field
+   efield
    nl
    sep.
 
@@ -15,26 +15,34 @@ Rootsymbol file.
 file -> records    : '$1'.
 
 record -> sep sep record : [<<>> | '$3'].
+
 record -> field sep record : [val('$1') | '$3'].
+
 record -> field sep sep record : [val('$1'), <<>> | '$4'].
+
 record -> field : [val('$1')].
 
 record -> efield sep record : [normval('$1') | '$3'].
+
 record -> efield : [normval('$1')].
 
 records -> record nls records : ['$1' | '$3'].
+
 records -> record nls : ['$1'].
+
 records -> record : ['$1'].
 
 nls -> nl nl : '$1'.
+
 nls -> nl : '$1'.
 
 Erlang code.
+
 %% -------------------------------------------------------------------
 %%
 %% xqerl_db - XML Database for xqerl XQuery processor
 %%
-%% Copyright (c) 2019 Zachary N. Dean  All Rights Reserved.
+%% Copyright (c) 2019-2020 Zachary N. Dean  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -53,21 +61,23 @@ Erlang code.
 %% -------------------------------------------------------------------
 %% @doc CSV parser.
 
-val({_,_,Token}) -> Token.
+val({_, _, Token}) -> Token.
 
-normval({_,_,Token}) -> norm(Token).
+normval({_, _, Token}) -> norm(Token).
 
-norm(<<$",$">>) -> <<>>;
-norm(<<$",_/binary>> = Val) ->
-   S = byte_size(Val),
-   B = binary:part(Val, 1, S - 2),
-   norm1(B, <<>>);
-norm(Val) -> Val.
+norm(<<$", $">>) ->
+    <<>>;
+norm(<<$", _/binary>> = Val) ->
+    S = byte_size(Val),
+    B = binary:part(Val, 1, S - 2),
+    norm1(B, <<>>);
+norm(Val) ->
+    Val.
 
 % normalize double quote
-norm1(<<$",$",Rest/binary>>, Acc) -> 
-   norm1(Rest, <<Acc/binary,$">>); 
-norm1(<<C/utf8,Rest/binary>>, Acc) -> 
-   norm1(Rest, <<Acc/binary,C/utf8>>);
-norm1(<<>>, Acc) -> Acc.
-   
+norm1(<<$", $", Rest/binary>>, Acc) ->
+    norm1(Rest, <<Acc/binary, $">>);
+norm1(<<C/utf8, Rest/binary>>, Acc) ->
+    norm1(Rest, <<Acc/binary, C/utf8>>);
+norm1(<<>>, Acc) ->
+    Acc.

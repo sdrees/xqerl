@@ -2,7 +2,7 @@
 %%
 %% xqerl - XQuery processor
 %%
-%% Copyright (c) 2018-2019 Zachary N. Dean  All Rights Reserved.
+%% Copyright (c) 2018-2020 Zachary N. Dean  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -21,6 +21,10 @@
 %% -------------------------------------------------------------------
 -module(xqldb_dml).
 
+%% Reading functions set the read locks in the function.
+%% Writing functions should only be called from a Pending Update List
+%%  where the write locks have already been acquired.
+
 -include("xqerl_db.hrl").
 
 %% ====================================================================
@@ -29,562 +33,569 @@
 
 -export([analyze/1]).
 
-
--export([select_paths/1,
-         select_collection/1,
-         delete_collection/1,
-         import_from_directory/2,
-         insert_doc_as_collection/3]).
+-export([
+    commit/1,
+    select_paths/2,
+    select_collection/2, select_collection/3,
+    delete_collection/1, delete_collection/2,
+    import_from_directory/2,
+    insert_doc_as_collection/3
+]).
 
 %% Generic
--export([%exists/1,
-         select/1%,
-         %insert/2,
-         %delete/1
-        ]).
+-export([select/2]).
 
 %% XML
--export([exists_doc/1,
-         select_doc/1,
-         insert_doc/2,
-         insert_doc_sax/2,
-         insert_doc_node/2,
-         delete_doc/1]).
 
-%% JSON
--export([exists_json_doc/1,
-         select_json_doc/1,
-         insert_json_doc/2,
-         delete_json_doc/1]).
+% only used in test
+-export([delete_doc/1]).
+
+-export([
+    exists_doc/2,
+    select_doc/1, select_doc/2
+]).
+
+-export([
+    insert_doc/2,
+    insert_doc_node/3
+]).
 
 %% Text/Binary Resource - Internal/External
--export([exists_resource/1,
-         select_resource/1,
-         insert_resource/2,
-         delete_resource/1,
-         link_resource/2]).
+-export([
+    exists_resource/1, exists_resource/2,
+    select_resource/3
+]).
+
+-export([
+    insert_resource/2,
+    insert_text_resource/3,
+    insert_binary_resource/3,
+    link_resource/3
+]).
 
 %% XDM Values
--export([exists_item/1,
-         select_item/1,
-         insert_item/2,
-         delete_item/1]).
+-export([
+    exists_item/2,
+    select_item/2
+]).
 
--define(ENSURE_BIN(Mod), Mod(DocUri) when is_list(DocUri) ->
-   Mod(unicode:characters_to_binary(DocUri))).
--define(ENSURE_BIN2(Mod), Mod(DocUri, Arg2) when is_list(DocUri) ->
-   Mod(unicode:characters_to_binary(DocUri), Arg2)).
--define(ENSURE_BIN3(Mod), Mod(DocUri, Arg2, Arg3) when is_list(DocUri) ->
-   Mod(unicode:characters_to_binary(DocUri), Arg2, Arg3)).
+-export([insert_item/2, insert_item/3]).
 
-select_paths(Uri) ->
-   DBs = xqldb_db:databases(Uri),
-   Fun = fun(DB) ->
-               DbUri = xqldb_path_table:uri(DB),
-               [xqldb_uri:join(DbUri, element(1, Rec)) 
-               || Rec <- xqldb_path_table:all(DB)]
-         end,
-   lists:flatmap(Fun, DBs).
+-define(BIN(Bin), #xqAtomicValue{type = 'xs:base64Binary', value = Bin}).
 
-select_collection(Uri) ->
-   DBs = xqldb_db:databases(Uri),
-   G = fun({N,xml,Sp}, #{db_name := DbPid}) ->
-             NodeId = {DbPid, {N, Sp}, []},
-             xqldb_nodes:get_doc(NodeId);
-          ({_,link,_,Filename}, _) ->
-             {ok, Bin} = file:read_file(Filename),
-             Bin;
-          ({_,json,_,{Pos,Len}}, DB) ->
-             xqldb_json_objs:build_object(DB, Pos, Len);
-          ({_,res,_,{Pos,Len}}, DB) ->
-             xqldb_resource_table:get(DB, {Pos,Len});
-          ({_,item,_,{Pos,Len}}, DB) ->
-             Res = xqldb_resource_table:get(DB, {Pos,Len}),
-             binary_to_term(Res, [safe]);
-          (Other, _) ->
-             ?dbg("Other",Other),
-             Other
-       end,         
-             
-   Fun = fun(DB) ->
-               [G(P, DB) || P <- xqldb_path_table:all(DB)]
-         end,
-   lists:flatten(lists:flatmap(Fun, DBs)).
+% used by fn:uri-collection
+select_paths(#{trans := Agent}, Uri) ->
+    DBs = xqldb_db:databases(Uri),
+    ok = read_lock_all(Agent, DBs),
+    Fun = fun(DB) ->
+        DbUri = xqldb_path_table:uri(DB),
+        [
+            xqldb_uri:join(DbUri, element(1, Rec))
+            || Rec <- xqldb_path_table:all(DB)
+        ]
+    end,
+    lists:flatmap(Fun, DBs).
 
+% used by fn:collection
+select_collection(#{trans := Agent} = Ctx, Uri) ->
+    DBs = xqldb_db:databases(Uri),
+    ok = read_lock_all(Agent, DBs),
+    Fun = fun(DB) ->
+        [
+            normalize_item(Ctx, P, DB)
+            || P <- xqldb_path_table:all(DB)
+        ]
+    end,
+    lists:flatten(lists:flatmap(Fun, DBs)).
+
+select_collection(#{trans := Agent} = Ctx, Uri, Type) ->
+    DBs = xqldb_db:databases(Uri),
+    ok = read_lock_all(Agent, DBs),
+    Fun = fun(DB) ->
+        [
+            normalize_item(Ctx, P, DB)
+            || P <- xqldb_path_table:all(DB, Type)
+        ]
+    end,
+    lists:flatten(lists:flatmap(Fun, DBs)).
+
+% used in test suite so create lock agent
 delete_collection(Uri) ->
-   DBs = xqldb_db:databases(Uri),
-   _ = [begin
-         xqldb_path_table:delete_all(DB)
-        end || DB <- DBs],
-   ok.
-   
+    Agent = new_agent(),
+    delete_collection(#{trans => Agent}, Uri),
+    locks:end_transaction(Agent).
+
+%% TODO remove Agent and put lock in PUL
+delete_collection(#{trans := Agent}, Uri) ->
+    DBs = xqldb_db:databases(Uri),
+    ok = write_lock_all(Agent, DBs),
+    _ = [xqldb_path_table:delete_all(DB) || DB <- DBs],
+    ok.
+
+read_lock_all(Agent, DBs) ->
+    % read-lock all [DbPid]
+    Locks = [
+        {[DbPid], read}
+        || #{db_name := DbPid} <- DBs
+    ],
+    ok = locks:lock_objects(Agent, Locks),
+    % now wait for the read locks
+    await_locks(Agent).
+
+write_lock_all(Agent, DBs) ->
+    Locks = [
+        {[DbPid, write], write}
+        || #{db_name := DbPid} <- DBs
+    ],
+    ok = locks:lock_objects(Agent, Locks),
+    % now wait for the write locks
+    await_locks(Agent).
+
+read_lock_one(Agent, #{db_name := DbPid}, Name) ->
+    ok = locks:lock_nowait(Agent, [DbPid, Name], read),
+    % now wait for the read lock
+    await_locks(Agent).
+
 %xqldb_structure_index:incr_counts(?STRUCT_INDEX_P(DB), Counts),
 analyze(DocUri) when is_binary(DocUri) ->
-   {DbUri,_Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         DB = xqldb_db:database(DbUri),
-         xqldb_structure_index:analyze(DB)
-   end;
-?ENSURE_BIN(analyze).
-
-select(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {xml, Stamp} ->
-               DBId = maps:get(db_name, DB),
-               NodeId = {DBId, {Name, Stamp}, []},
-               xqldb_nodes:get_doc(NodeId);
-            {item, _Stamp, {Pos, Len}} ->
-               Res = xqldb_resource_table:get(DB, {Pos, Len}),
-               binary_to_term(Res, [safe]);
-            {link, _Stamp, FileName} ->
-               {ok, Bin} = file:read_file(FileName),
-               Bin;
-            {res,  _Stamp, {Pos, Len}} ->
-               xqldb_resource_table:get(DB, {Pos, Len});
-            {json, _Stamp, {Pos, Len}} ->
-               xqldb_json_objs:build_object(DB, Pos, Len);
-            _ ->
-               {error, not_exists}
-         end
-   end;
-?ENSURE_BIN(select).
-
-exists_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db_server:info(DbUri) of
-      {error, not_exists} -> false;
-      {closed, _, _} -> 
-         _ = xqldb_db:open(DbUri),
-         timer:sleep(1),
-         exists_doc(DocUri);
-      {opening, _, _} -> 
-         timer:sleep(1),
-         exists_doc(DocUri);
-      _ -> 
-         DB = xqldb_db:database(DbUri),
-         xqldb_path_table:lookup(DB, Name) =/= []
-   end;
-?ENSURE_BIN(exists_doc).
-
-select_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   {Agent, _} = locks:begin_transaction([{[DbUri,Name], read}]),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         #{db_name := DBId} = DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {xml,Stamp} ->
-               NodeId = {DBId, {Name,Stamp}, []},
-               Node = xqldb_nodes:get_doc(NodeId),
-               _ = locks:end_transaction(Agent),
-               Node;
-            _ ->
-               _ = locks:end_transaction(Agent),
-               {error, not_exists}
-         end
-   end;
-?ENSURE_BIN(select_doc).
-
-insert_doc(DocUri, Filename) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   {Agent, _} = locks:begin_transaction([{[DbUri,Name], write}]),
-   DB = xqldb_db:database(DbUri),
-   case xqldb_path_table:lookup(DB, Name) of
-      [] -> 
-         try
-            Stamp = erlang:system_time(),
-            ok = xqldb_sax:parse_file(DB,Filename,Name,Stamp),
-            xqldb_path_table:insert(DB, {Name, xml, Stamp})
-         after
-            locks:end_transaction(Agent)
-         end;
-      _ ->
-         locks:end_transaction(Agent)
-   end;
-?ENSURE_BIN2(insert_doc).
-
-insert_doc_sax(DocUri, Filename) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   {Agent, _} = locks:begin_transaction(),
-   _ = locks:lock(Agent, [DbUri,Name]),
-   DB = xqldb_db:database(DbUri),
-   case xqldb_path_table:lookup(DB, Name) of
-      [] ->
-         try
-            Stamp = erlang:system_time(),
-            ok = xqldb_sax:parse_list(DB,Filename,Name,Stamp),
-            xqldb_path_table:insert(DB, {Name, xml, Stamp})
-         after
-            locks:end_transaction(Agent)
-         end;
-      _ ->
-         locks:end_transaction(Agent)
-   end;
-?ENSURE_BIN2(insert_doc_sax).
-
-insert_doc_node(DocUri, Node) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   {Agent, _} = locks:begin_transaction(),
-   _ = locks:lock(Agent, [DbUri,Name]),
-   DB = xqldb_db:database(DbUri),
-   case xqldb_path_table:lookup(DB, Name) of
-      [] ->
-         try
-            Stamp = erlang:system_time(),
-            ok = xqldb_sax:parse_node(DB, Node, Name, Stamp),
-            xqldb_path_table:insert(DB, {Name, xml, Stamp})
-         after
-            locks:end_transaction(Agent)
-         end;
-      _ ->
-         locks:end_transaction(Agent)
-   end;
-?ENSURE_BIN2(insert_doc_node).
-
-delete_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> ok;
-      true ->
-         {Agent, _} = locks:begin_transaction(),
-         _ = locks:lock(Agent, [DbUri,Name]),
-         try
+    {DbUri, _Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            {error, not_exists};
+        true ->
             DB = xqldb_db:database(DbUri),
-            xqldb_path_table:delete(DB, Name)
-         after
+            xqldb_structure_index:analyze(DB)
+    end.
+
+select(#{trans := Agent} = Ctx, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            {error, not_exists};
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            Rec = xqldb_path_table:lookup(DB, Name),
+            normalize_item(Ctx, Rec, Name, DB)
+    end.
+
+exists_doc(#{trans := Agent}, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            false;
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            case xqldb_path_table:lookup(DB, Name) of
+                {xml, _} ->
+                    true;
+                _ ->
+                    false
+            end
+    end.
+
+% called from test suite
+select_doc(DocUriL) ->
+    DocUri = unicode:characters_to_binary(DocUriL),
+    Agent = new_agent(),
+    Doc = select_doc(#{trans => Agent}, DocUri),
+    locks:end_transaction(Agent),
+    Doc.
+
+select_doc(#{trans := Agent}, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            {error, not_exists};
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            #{db_name := DBId} = DB = xqldb_db:database(DbUri),
+            case xqldb_path_table:lookup(DB, Name) of
+                {xml, Stamp} ->
+                    NodeId = {DBId, {Name, Stamp}, []},
+                    xqldb_nodes:get_doc(NodeId);
+                _ ->
+                    {error, not_exists}
+            end
+    end.
+
+% called from test suite
+insert_doc(DocUriL, Filename) ->
+    DocUri = unicode:characters_to_binary(DocUriL),
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    Agent = new_agent(),
+    locks:lock_nowait(Agent, [DbUri, Name]),
+    ok = await_locks(Agent),
+    DB = xqldb_db:database(DbUri),
+    case xqldb_path_table:lookup(DB, Name) of
+        [] ->
+            try
+                Stamp = erlang:system_time(),
+                ok = xqldb_sax:parse_file(DB, Filename, Name, Stamp),
+                xqldb_path_table:insert(DB, {Name, xml, Stamp})
+            after
+                locks:end_transaction(Agent)
+            end;
+        _ ->
             locks:end_transaction(Agent)
-         end             
-   end;
-?ENSURE_BIN(delete_doc).
+    end.
 
-exists_json_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> false;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {json,_,_} -> true;
-            _ -> false
-         end
-   end;
-?ENSURE_BIN(exists_json_doc).
+% only used in xquts_SUITE
+delete_doc(DocUriL) ->
+    DocUri = unicode:characters_to_binary(DocUriL),
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    Agent = new_agent(),
+    locks:lock_nowait(Agent, [DbUri, Name]),
+    ok = await_locks(Agent),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            locks:end_transaction(Agent);
+        true ->
+            DB = xqldb_db:database(DbUri),
+            case xqldb_path_table:lookup(DB, Name) of
+                {xml, _} ->
+                    commit([{DB, delete, Name}]),
+                    locks:end_transaction(Agent);
+                _ ->
+                    locks:end_transaction(Agent)
+            end
+    end.
 
-select_json_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {json, _Stamp, {Pos, Len}} ->
-               xqldb_json_objs:build_object(DB, Pos, Len);
-            _ ->
-               {error, not_exists}
-         end
-   end;
-?ENSURE_BIN(select_json_doc).
+% called from xqerl_update, already in transaction
+% return {DB, insert, InsertRec}
+insert_doc_node(Node, DB, Name) ->
+    Stamp = erlang:system_time(),
+    ok = xqldb_sax:parse_node(DB, Node, Name, Stamp),
+    {DB, insert, {Name, xml, Stamp}}.
 
-insert_json_doc(DocUri, String) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_json_objs:string_to_json_bin(String) of
-            Bin when is_binary(Bin) ->
-               PosSize = xqldb_json_table:insert(DB, Bin),
-               Stamp = erlang:system_time(),
-               xqldb_path_table:insert(DB, {Name,json,PosSize,Stamp});
-            Error ->
-               Error
-         end
-   end;
-?ENSURE_BIN2(insert_json_doc).
-
-delete_json_doc(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> ok;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         xqldb_path_table:delete(DB, Name)
-   end;
-?ENSURE_BIN(delete_json_doc).
-
-
+% used in test suite
 exists_resource(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> false;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {res,_,_} ->
-               true;
-            {link,_,_} ->
-               true;
-            _ ->
-               false
-         end
-   end;
-?ENSURE_BIN(exists_resource).
+    Agent = new_agent(),
+    Res = exists_resource(#{trans => Agent}, DocUri),
+    locks:end_transaction(Agent),
+    Res.
 
-select_resource(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> 
-         try
-            Fn = xqldb_lib:uri_to_filename(DocUri),
-            {ok, Bin} = file:read_file(Fn),
-            Bin
-         catch
-            _:_ ->
-               {error, not_exists}
-         end;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {res,_,PosSize} ->
-               xqldb_resource_table:get(DB, PosSize);
-            {link,_,Filename} ->
-               {ok, Bin} = file:read_file(Filename),
-               Bin;
-            [] ->
-               try
-                  Fn = xqldb_lib:uri_to_filename(DocUri),
-                  {ok, Bin} = file:read_file(Fn),
-                  Bin
-               catch
-                  _:_ ->
-                     {error, not_exists}
-               end
-         end
-   end;
-?ENSURE_BIN(select_resource).
+exists_resource(#{trans := Agent}, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            false;
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            case xqldb_path_table:lookup(DB, Name) of
+                {text, _, _} -> true;
+                {raw, _, _} -> true;
+                {link, _, _} -> true;
+                _ -> false
+            end
+    end.
 
-insert_resource(DocUri, Bin) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   {Agent, _} = locks:begin_transaction(),
-   _ = locks:lock(Agent, [DbUri,Name]),
-   DB = xqldb_db:database(DbUri),
-   case xqldb_path_table:lookup(DB, Name) of
-      [] -> 
-         Stamp = erlang:system_time(),
-         PosSize = xqldb_resource_table:insert(DB, Bin),
-         xqldb_path_table:insert(DB, {Name, res, PosSize, Stamp}),
-         locks:end_transaction(Agent);
-      _ ->
-         locks:end_transaction(Agent)
-   end;
-?ENSURE_BIN2(insert_resource).
+select_resource(#{trans := Agent} = Ctx, DocUri, Type) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            % not locking anything
+            try
+                get_remote_resource(Ctx, DocUri, Type)
+            catch
+                _:_ ->
+                    {error, not_exists}
+            end;
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            case xqldb_path_table:lookup(DB, Name) of
+                [] ->
+                    try
+                        get_remote_resource(Ctx, DocUri, Type)
+                    catch
+                        _:_ ->
+                            {error, not_exists}
+                    end;
+                Rec ->
+                    normalize_item(Ctx, Rec, Name, DB)
+            end
+    end.
 
-delete_resource(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> ok;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         xqldb_path_table:delete(DB, Name)
-   end;
-?ENSURE_BIN(delete_resource).
+% called from test suite for unparsed-text
+insert_resource(DocUri, Bin) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    Agent = new_agent(),
+    locks:lock_nowait(Agent, [DbUri, Name]),
+    ok = await_locks(Agent),
+    DB = xqldb_db:database(DbUri),
+    case xqldb_path_table:lookup(DB, Name) of
+        [] ->
+            try
+                Stamp = erlang:system_time(),
+                NewPosSize = xqldb_resource_table:insert(DB, Bin),
+                xqldb_path_table:insert(DB, {Name, text, NewPosSize, Stamp})
+            after
+                locks:end_transaction(Agent)
+            end;
+        _ ->
+            locks:end_transaction(Agent)
+    end.
 
-link_resource(DocUri, Filename) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   DB = case xqldb_db:exists(DbUri) of
-           false -> 
-              _ = xqldb_db:open(DbUri),
-              xqldb_db:database(DbUri);
-           true ->
-              xqldb_db:database(DbUri)
-        end,
-   Stamp = erlang:system_time(),
-   xqldb_path_table:insert(DB, {Name, link, Filename, Stamp});
-?ENSURE_BIN2(link_resource).
+% this should be called in a transaction that already has
+% write locks on everything.
+% Returns {DB, insert, Rec}
+insert_text_resource(DB, Name, Bin) ->
+    Stamp = erlang:system_time(),
+    NewPosSize = xqldb_resource_table:insert(DB, Bin),
+    {DB, insert, {Name, text, NewPosSize, Stamp}}.
 
-exists_item(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> false;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            Term when is_tuple(Term) ->
-               true;
-            _ ->
-               false
-         end
-   end;
-?ENSURE_BIN(exists_item).
+insert_binary_resource(DB, Name, Bin) ->
+    Stamp = erlang:system_time(),
+    NewPosSize = xqldb_resource_table:insert(DB, Bin),
+    {DB, insert, {Name, raw, NewPosSize, Stamp}}.
 
-select_item(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> {error, not_exists};
-      true ->
-         DB = xqldb_db:database(DbUri),
-         case xqldb_path_table:lookup(DB, Name) of
-            {item, _, PosSize} ->
-               Res = xqldb_resource_table:get(DB, PosSize),
-               binary_to_term(Res, [safe]);
-            [] ->
-               {error, not_exists}
-         end
-   end;
-?ENSURE_BIN(select_item).
+% Returns {DB, insert, Rec}
+link_resource(DB, Name, Filename) ->
+    Stamp = erlang:system_time(),
+    {DB, insert, {Name, link, Filename, Stamp}}.
 
+exists_item(#{trans := Agent}, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            false;
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            case xqldb_path_table:lookup(DB, Name) of
+                Term when is_tuple(Term) ->
+                    true;
+                _ ->
+                    false
+            end
+    end.
+
+select_item(#{trans := Agent}, DocUri) when is_binary(DocUri) ->
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    case xqldb_db:exists(DbUri) of
+        false ->
+            {error, not_exists};
+        true ->
+            DB = xqldb_db:database(DbUri),
+            ok = read_lock_one(Agent, DB, Name),
+            case xqldb_path_table:lookup(DB, Name) of
+                {item, _, PosSize} ->
+                    Res = xqldb_resource_table:get(DB, PosSize),
+                    binary_to_term(Res, [safe]);
+                [] ->
+                    {error, not_exists}
+            end
+    end.
+
+create_or_open_db(DbUri) ->
+    case xqldb_db:exists(DbUri) of
+        false ->
+            _ = xqldb_db:open(DbUri),
+            xqldb_db:database(DbUri);
+        true ->
+            xqldb_db:database(DbUri)
+    end.
+
+% called from test suite out of transaction
 insert_item(DocUri, Item) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   DB = case xqldb_db:exists(DbUri) of
-           false -> 
-              _ = xqldb_db:open(DbUri),
-              xqldb_db:database(DbUri);
-           true ->
-              xqldb_db:database(DbUri)
-        end,
-   Stamp = erlang:system_time(),
-   Bin = term_to_binary(Item),
-   PosSize = xqldb_resource_table:insert(DB, Bin),
-   xqldb_path_table:insert(DB, {Name, item, PosSize, Stamp});
-?ENSURE_BIN2(insert_item).
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    DB = create_or_open_db(DbUri),
+    Stamp = erlang:system_time(),
+    Bin = term_to_binary(Item),
+    PosSize = xqldb_resource_table:insert(DB, Bin),
+    xqldb_path_table:insert(DB, {Name, item, PosSize, Stamp}).
 
-delete_item(DocUri) when is_binary(DocUri) ->
-   {DbUri,Name} = xqldb_uri:split_uri(DocUri),
-   case xqldb_db:exists(DbUri) of
-      false -> ok;
-      true ->
-         DB = xqldb_db:database(DbUri),
-         xqldb_path_table:delete(DB, Name)
-   end;
-?ENSURE_BIN(delete_item).
-
+% Returns {DB, insert, Rec}
+insert_item(DB, Name, Item) ->
+    Stamp = erlang:system_time(),
+    Bin = term_to_binary(Item),
+    PosSize = xqldb_resource_table:insert(DB, Bin),
+    {DB, insert, {Name, item, PosSize, Stamp}}.
 
 insert_doc_as_collection(DocUri, Filename, BasePath) when is_binary(DocUri) ->
-   ReplyTo = self(),
-   {DbUri, Name} = xqldb_uri:split_uri(DocUri),
-   DB = case xqldb_db:exists(DbUri) of
-           false -> 
-              _ = xqldb_db:open(DbUri),
-              xqldb_db:database(DbUri);
-           true ->
-              xqldb_db:database(DbUri)
+    ReplyTo = self(),
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    DB = create_or_open_db(DbUri),
+    InsFun = fun(Events) ->
+        F = fun() ->
+            Self = self(),
+            uuid:new(Self),
+            UUID = uuid:get_v4_urandom(),
+            NName = uuid:uuid_to_string(UUID, binary_standard),
+            Name1 = <<Name/binary, $-, NName/binary>>,
+            Stamp = erlang:system_time(),
+            xqldb_sax:parse_list(DB, Events, Name1, Stamp),
+            _ = xqldb_path_table:insert(DB, {Name1, xml, Stamp}),
+            ReplyTo ! {Self, done}
         end,
-   InsFun = fun(Events) ->
-                  F = fun() ->
-                            Self = self(),
-                            uuid:new(Self),
-                            UUID = uuid:get_v4_urandom(),
-                            NName = uuid:uuid_to_string(UUID, binary_standard),
-                            Name1 = <<Name/binary,$-,NName/binary>>,
-                            Stamp = erlang:system_time(),
-                            xqldb_sax:parse_list(DB, Events, Name1,Stamp),
-                            _ = xqldb_path_table:insert(DB, {Name1, xml, Stamp}),
-                            ReplyTo ! {Self, done} 
-                      end,
-                  erlang:spawn_link(F)                                               
-            end,
-   Path = path_to_stack(BasePath),
-   xqldb_sax:split_parse_file(Filename, InsFun, Path);
-?ENSURE_BIN3(insert_doc_as_collection).
-
+        erlang:spawn_link(F)
+    end,
+    Path = path_to_stack(BasePath),
+    xqldb_sax:split_parse_file(Filename, InsFun, Path).
 
 import_from_directory(BaseUri, Directory) when is_list(Directory) ->
-   Dir = filename:absname(Directory),
-   % all relative filenames
-   All = filelib:wildcard("**/*.xml", Dir),
-   Grouped = group(All, dict:new(), Dir, list_to_binary(BaseUri)),
-   Parent = self(),
-   Fun = fun(DbUri, Vals, Acc) ->
-               DB = case xqldb_db:exists(DbUri) of
-                       true ->
-                          xqldb_db:database(DbUri);
-                       false ->
-                          {ok, _, _} = xqldb_db:open(DbUri),
-                          xqldb_db:database(DbUri)
-                    end,
-               Fun1 = fun() ->
-                            {Agent, _} = locks:begin_transaction(),
-                            % lock entire database
-                            {ok, _} = locks:lock(Agent, [DbUri]),
-                            [try
-                                Stamp = erlang:system_time(),
-                                xqldb_sax:parse_file(DB, FN, Name, Stamp),
-                                _ = xqldb_path_table:insert(DB, {Name, xml, Stamp}),
-                                ok
-                             catch _:_ -> ok
-                             end ||
-                             {FN,Name} <- Vals],
-                            locks:end_transaction(Agent),
-                            Parent ! {done, self(), DbUri}
-                      end,
-               Child = erlang:spawn(Fun1),
-               [{Child, DbUri}|Acc] 
-         end,
-   Uris = dict:fold(Fun, [], Grouped),
-   collect_uris(Uris).
-
+    Dir = filename:absname(Directory),
+    % all relative filenames
+    All = filelib:wildcard("**/*.xml", Dir),
+    Grouped = group(All, dict:new(), Dir, list_to_binary(BaseUri)),
+    Parent = self(),
+    Fun = fun(DbUri, Vals, Acc) ->
+        DB =
+            case xqldb_db:exists(DbUri) of
+                true ->
+                    xqldb_db:database(DbUri);
+                false ->
+                    {ok, _, _} = xqldb_db:open(DbUri),
+                    xqldb_db:database(DbUri)
+            end,
+        Fun1 = fun() ->
+            {Agent, _} = locks:begin_transaction(),
+            % lock entire database
+            {ok, _} = locks:lock(Agent, [DbUri]),
+            [
+                try
+                    Stamp = erlang:system_time(),
+                    xqldb_sax:parse_file(DB, FN, Name, Stamp),
+                    _ = xqldb_path_table:insert(DB, {Name, xml, Stamp}),
+                    ok
+                catch
+                    _:_ -> ok
+                end
+                || {FN, Name} <- Vals
+            ],
+            locks:end_transaction(Agent),
+            Parent ! {done, self(), DbUri}
+        end,
+        Child = erlang:spawn(Fun1),
+        [{Child, DbUri} | Acc]
+    end,
+    Uris = dict:fold(Fun, [], Grouped),
+    collect_uris(Uris).
 
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
 
-collect_uris([]) -> ok;
-collect_uris([{Pid, Uri}|T]) -> 
-   receive
-      {done, Pid, Uri} ->
-         collect_uris(T)
-   after 
-      600000 -> 
-         erlang:exit(Pid, timeout),
-         collect_uris(T)
-   end.
-
-   
-
-
+collect_uris([]) ->
+    ok;
+collect_uris([{Pid, Uri} | T]) ->
+    receive
+        {done, Pid, Uri} ->
+            collect_uris(T)
+    after 600000 ->
+        erlang:exit(Pid, timeout),
+        collect_uris(T)
+    end.
 
 path_to_stack(Path) when is_binary(Path) ->
-   path_to_stack(binary_to_list(Path));
+    path_to_stack(binary_to_list(Path));
 path_to_stack(Path) when is_list(Path) ->
-   Split = filename:split(Path),
-   compile_stack(Split, []).
+    Split = filename:split(Path),
+    compile_stack(Split, []).
 
-compile_stack(["/"|Ts], Acc) ->
-   compile_stack(Ts, [document|Acc]);
-compile_stack([QName|Ts], Acc) ->
-   case string:split(QName, ":") of
-      [Prefix, Name] ->
-         compile_stack(Ts, [{element, Prefix, Name}|Acc]);
-      [Name] ->
-         compile_stack(Ts, [{element, [], Name}|Acc])
-   end;
+compile_stack(["/" | Ts], Acc) ->
+    compile_stack(Ts, [document | Acc]);
+compile_stack([QName | Ts], Acc) ->
+    case string:split(QName, ":") of
+        [Prefix, Name] ->
+            compile_stack(Ts, [{element, Prefix, Name} | Acc]);
+        [Name] ->
+            compile_stack(Ts, [{element, [], Name} | Acc])
+    end;
 compile_stack([], Acc) ->
-  Acc.
+    Acc.
 
- 
-% startDocument
-% {startElement, _UriS, LocalNameS, {PrefixS,_}, _Attributes}
+group([], Dict, _, _) ->
+    Dict;
+group([F | Fs], Dict, FileDir, BaseUri0) ->
+    BaseUri =
+        case binary:last(BaseUri0) of
+            $/ ->
+                BaseUri0;
+            _ ->
+                <<BaseUri0/binary, $/>>
+        end,
+    FileName = filename:join([FileDir, F]),
+    DocUri = xqldb_lib:join_uris(BaseUri, unicode:characters_to_binary(F)),
+    {DbUri, Name} = xqldb_uri:split_uri(DocUri),
+    Value = {FileName, Name},
+    group(Fs, dict:append(DbUri, Value, Dict), FileDir, BaseUri).
 
+get_remote_resource(#{tab := Tab}, Uri, Type) ->
+    Key = {remote, Type, Uri},
+    case ets:lookup(Tab, Key) of
+        [Obj] ->
+            Obj;
+        [] ->
+            Res = xqerl_lib:get_remote_resource(Uri, Type),
+            ets:insert(Tab, {Key, Res}),
+            Res
+    end.
 
-group([], Dict, _, _) -> Dict;
-group([F|Fs], Dict, FileDir, BaseUri0) ->
-   BaseUri = case binary:last(BaseUri0) of
-                $/ ->
-                   BaseUri0;
-                _ ->
-                   <<BaseUri0/binary,$/>>
-             end,
-   FileName = filename:join([FileDir, F]),
-   DocUri = xqldb_lib:join_uris(BaseUri, unicode:characters_to_binary(F)),
-   {DbUri, Name} = xqldb_uri:split_uri(DocUri),
-   Value = {FileName, Name},
-   group(Fs,dict:append(DbUri, Value, Dict), FileDir, BaseUri).
+new_agent() ->
+    {ok, Agent} = locks_agent:start([
+        {abort_on_deadlock, true},
+        {link, true}
+    ]),
+    Agent.
 
+%% Takes a list of {DB, insert | delete, Rec} where Rec is what is to inserted to the path table or
+% the name of the Rec by delete.
+-spec commit([{map(), insert | delete, tuple() | binary()}]) -> ok.
+commit(Transaction) ->
+    _ = [
+        case InsDel of
+            insert ->
+                xqldb_path_table:delete(DB, element(1, Rec)),
+                xqldb_path_table:insert(DB, Rec);
+            delete when Rec =:= all ->
+                xqldb_path_table:delete_all(DB);
+            delete ->
+                % Rec is the Name
+                xqldb_path_table:delete(DB, Rec)
+        end
+        || {DB, InsDel, Rec} <- Transaction
+    ],
+    ok.
+
+await_locks(Agent) ->
+    case locks_agent:transaction_status(Agent) of
+        no_locks ->
+            ok;
+        _ ->
+            {have_all_locks, _} = locks:await_all_locks(Agent),
+            ok
+    end.
+
+normalize_item(_, {xml, Sp}, N, #{db_name := DbPid}) ->
+    NodeId = {DbPid, {N, Sp}, []},
+    xqldb_nodes:get_doc(NodeId);
+normalize_item(Ctx, {A, B, C}, N, DB) ->
+    normalize_item(Ctx, {N, A, B, C}, DB).
+
+% given path table record and DB, return the item
+normalize_item(_, {N, xml, Sp}, #{db_name := DbPid}) ->
+    NodeId = {DbPid, {N, Sp}, []},
+    xqldb_nodes:get_doc(NodeId);
+normalize_item(#{tab := Tab}, {_, link, _, Filename}, _) ->
+    Key = {remote, link, Filename},
+    case ets:lookup(Tab, Key) of
+        [Obj] ->
+            ?BIN(Obj);
+        [] ->
+            {ok, Bin} = file:read_file(Filename),
+            ets:insert(Tab, {Key, Bin}),
+            ?BIN(Bin)
+    end;
+normalize_item(_, {_, text, _, {Pos, Len}}, DB) ->
+    xqldb_resource_table:get(DB, {Pos, Len});
+normalize_item(_, {_, raw, _, {Pos, Len}}, DB) ->
+    Bin = xqldb_resource_table:get(DB, {Pos, Len}),
+    ?BIN(Bin);
+normalize_item(_, {_, item, _, {Pos, Len}}, DB) ->
+    Res = xqldb_resource_table:get(DB, {Pos, Len}),
+    binary_to_term(Res, [safe]).

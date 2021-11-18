@@ -2,7 +2,7 @@
 %%
 %% xqerl - XQuery processor
 %%
-%% Copyright (c) 2017-2019 Zachary N. Dean  All Rights Reserved.
+%% Copyright (c) 2017-2020 Zachary N. Dean  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -20,7 +20,7 @@
 %%
 %% -------------------------------------------------------------------
 
-%% @doc 
+%% @doc
 
 -module(xqerl_sup).
 
@@ -44,27 +44,30 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-   SupFlags = #{strategy => one_for_one},
-   Server = child_map(worker, xqerl_code_server, []),
-   DB     = child_map(supervisor, xqldb_sup, []),
-   Trace = event_child_map(xqerl_trace_man),
-   Event = event_child_map(xqerl_event_man),
-   
-   {ok, {SupFlags, [Server, DB, Trace, Event]}}.
+    SupFlags = #{strategy => one_for_one},
+    Server = child_map(worker, xqerl_code_server, []),
+    DB = child_map(supervisor, xqldb_sup, []),
+    Trace = event_child_map(xqerl_trace_man),
+    Event = event_child_map(xqerl_event_man),
+
+    {ok, {SupFlags, [Server, DB, Trace, Event]}}.
 
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
 
 child_map(Type, Module, Args) ->
-   #{id        => Module,
-     type      => Type,
-     shutdown  => brutal_kill,
-     start     => {Module, start_link, Args},
-     modules   => [Module]}.
+    #{
+        id => Module,
+        type => Type,
+        shutdown => brutal_kill,
+        start => {Module, start_link, Args},
+        modules => [Module]
+    }.
 
 event_child_map(Name) ->
-   #{id        => Name,
-     start     => {gen_event, start_link, [{local, Name}]},
-     modules   => dynamic}.
-
+    #{
+        id => Name,
+        start => {gen_event, start_link, [{local, Name}]},
+        modules => dynamic
+    }.
